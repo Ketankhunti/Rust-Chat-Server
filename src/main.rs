@@ -2,8 +2,8 @@
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
+        ws::{Message, Utf8Bytes, WebSocket},
+        Path, State, WebSocketUpgrade,
     },
     response::IntoResponse,
     routing::get,
@@ -17,20 +17,24 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-// We use a type alias for our shared state to make the code cleaner.
-// It's a thread-safe, shared map from a client's unique ID to their WebSocket sender.
-type ChatState = Arc<Mutex<HashMap<Uuid, SplitSink<WebSocket, Message>>>>;
+// A type alias for the sender part of a WebSocket connection.
+type ClientSender = SplitSink<WebSocket, Message>;
+
+// A type alias for our shared state.
+// The outer HashMap's key is the room name (a String).
+// The value is another HashMap where the key is a client's UUID and the value is their sender.
+type ChatState = Arc<Mutex<HashMap<String, HashMap<Uuid, ClientSender>>>>;
 
 /// The main entry point for our application.
 #[tokio::main]
 async fn main() {
-    // Create the shared state. We wrap our HashMap in a Mutex and an Arc.
+    // Create the shared state, an empty map of rooms.
     let state = ChatState::new(Mutex::new(HashMap::new()));
 
     // Define the application routes.
-    // We pass our shared state to the handler using `with_state`.
+    // The route `/ws/{room}` captures a dynamic path segment.
     let app = Router::new()
-        .route("/ws", get(websocket_handler))
+        .route("/ws/{room}", get(websocket_handler))
         .with_state(state);
 
     // Define the address to listen on.
@@ -45,83 +49,95 @@ async fn main() {
 }
 
 /// The handler for the WebSocket route.
-/// It now accepts the shared `ChatState` as an argument.
+/// It now uses `Path` to extract the room name from the URL.
 async fn websocket_handler(
     ws: WebSocketUpgrade,
-    State(state): State<ChatState>, // axum's State extractor
+    State(state): State<ChatState>,
+    Path(room): Path<String>, // Extracts the `room` from `/ws/:room`
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+    println!("New client connecting to room: {}", room);
+    ws.on_upgrade(|socket| handle_socket(socket, state, room))
 }
 
-/// Handles an individual WebSocket connection.
-///
-/// This function now contains the core logic for a client's lifecycle.
-async fn handle_socket(socket: WebSocket, state: ChatState) {
-    // Generate a unique ID for this new client.
+/// Handles an individual WebSocket connection, now aware of its room.
+async fn handle_socket(socket: WebSocket, state: ChatState, room: String) {
     let client_id = Uuid::new_v4();
-    println!("New client connected: {}", client_id);
+    println!("Client {} joined room '{}'", client_id, room);
 
-    // Split the WebSocket into a sender and a receiver.
-    // The sender can be cloned and shared, while the receiver is unique to this task.
     let (sender, receiver) = socket.split();
 
-    // Store the sender part of the socket in our shared state.
-    // We lock the mutex to ensure exclusive access.
+    // Add the new client to the state for the given room.
     {
-        let mut clients = state.lock().await;
-        clients.insert(client_id, sender);
-    } // The lock is released here as `clients` goes out of scope.
+        let mut rooms = state.lock().await;
+        // `entry` gets or inserts a room, `or_default` creates a new HashMap if it doesn't exist.
+        let room_clients = rooms.entry(room.clone()).or_default();
+        room_clients.insert(client_id, sender);
+    }
 
-    // This task will handle messages coming *from* the client.
-    let mut receive_task = tokio::spawn(read_from_client(receiver, client_id, state.clone()));
+    // Spawn a task to handle messages from this client.
+    let mut receive_task = tokio::spawn(read_from_client(receiver, client_id, state.clone(), room.clone()));
 
-    // Wait for the receive task to complete. This happens when the client disconnects.
+    // Wait for the client to disconnect.
     tokio::select! {
         _ = &mut receive_task => {
-            // The receive task finished, which means the client disconnected.
+            // The receive task finished, indicating the client disconnected.
         }
     }
 
-    // If we get here, the client has disconnected.
-    // We need to remove them from the shared state.
-    println!("Client {} disconnected.", client_id);
-    let mut clients = state.lock().await;
-    clients.remove(&client_id);
+    // Client has disconnected, so we perform cleanup.
+    println!("Client {} disconnected from room '{}'.", client_id, room);
+    cleanup_client(&state, client_id, &room).await;
 }
 
-/// Reads messages from a client and broadcasts them to others.
+/// Reads messages from a client and broadcasts them to their room.
 async fn read_from_client(
     mut receiver: SplitStream<WebSocket>,
     client_id: Uuid,
     state: ChatState,
+    room: String,
 ) {
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
-            println!("Received message from {}: {}", client_id, text);
-            // Broadcast the message to all other connected clients.
-            broadcast_message(text.to_string(), client_id, &state).await;
+            println!("Received message from {} in room '{}': {}", client_id, room, text);
+            // Broadcast the message to the client's room.
+            broadcast_to_room(&text, client_id, &state, &room).await;
         }
     }
 }
 
-/// Broadcasts a message to all connected clients except the sender.
-async fn broadcast_message(text: String, sender_id: Uuid, state: &ChatState) {
-    let mut clients = state.lock().await;
+/// Broadcasts a message to all clients in a specific room, except the sender.
+async fn broadcast_to_room(text: &str, sender_id: Uuid, state: &ChatState, room: &str) {
+    let mut rooms = state.lock().await;
 
-    // We create a message to be sent. We can add more info here later.
-    let broadcast_text = format!("[{}]: {}", sender_id, text);
-    let message = Message::Text(broadcast_text.into());
+    if let Some(room_clients) = rooms.get_mut(room) {
+        let broadcast_text = format!("[{}]: {}", sender_id, text);
+        let message = Message::Text(Utf8Bytes::from(broadcast_text));
 
-    // Iterate over all connected clients.
-    for (id, sender) in clients.iter_mut() {
-        // Don't send the message back to the original sender.
-        if *id != sender_id {
-            // Send the message. If it fails, the client might have disconnected
-            // abruptly. We can log this but won't handle removal here, as the
-            // main `handle_socket` task will take care of cleanup.
-            if sender.send(message.clone()).await.is_err() {
-                println!("Failed to send message to client {}", id);
+        // Iterate over all clients in the room.
+        for (id, sender) in room_clients.iter_mut() {
+            if *id != sender_id {
+                if sender.send(message.clone()).await.is_err() {
+                    // This client might have disconnected abruptly.
+                    // The main `handle_socket` task will handle the final cleanup.
+                    println!("Failed to send message to client {}", id);
+                }
             }
+        }
+    }
+}
+
+/// Removes a client from the state and cleans up the room if it becomes empty.
+async fn cleanup_client(state: &ChatState, client_id: Uuid, room: &str) {
+    let mut rooms = state.lock().await;
+
+    // Remove the client from the room.
+    if let Some(room_clients) = rooms.get_mut(room) {
+        room_clients.remove(&client_id);
+
+        // If the room is now empty, remove the room itself.
+        if room_clients.is_empty() {
+            println!("Room '{}' is empty, removing it.", room);
+            rooms.remove(room);
         }
     }
 }
