@@ -13,7 +13,7 @@ pub enum ClientMessage {
 
 /// A message sent from the server to a client.
 /// Serialized into JSON text for sending.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
     UserJoined { username: String },

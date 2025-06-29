@@ -1,20 +1,29 @@
 // src/main.rs
 
-// Declare the modules we're using
+mod database;
 mod models;
 mod state;
 mod websocket;
 
 use axum::{routing::get, Router};
 use state::ChatState;
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
 use websocket::websocket_handler;
 
 #[tokio::main]
 async fn main() {
-    // Initialize the shared state (an empty map of rooms)
-    let state = ChatState::new(Mutex::new(HashMap::new()));
+    // Set up the database connection pool.
+    // .expect will crash the app if the DB can't be opened, which is reasonable on startup.
+    let db_pool = database::setup_database()
+        .await
+        .expect("Failed to set up database");
+
+    // The ChatState is a struct holding the map of rooms and the db_pool.
+    let state = ChatState {
+        rooms: Arc::new(Mutex::new(HashMap::new())),
+        db_pool,
+    };
 
     // Define the application routes
     let app = Router::new()
@@ -34,3 +43,4 @@ async fn main() {
         .await
         .unwrap();
 }
+

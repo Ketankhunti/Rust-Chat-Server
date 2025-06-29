@@ -24,6 +24,9 @@ The server is currently functional and supports the following features:
 - **Chat Rooms**: Support for multiple chat rooms with isolated messaging
 - **Message Broadcasting**: Broadcasts messages to all clients in a room
 - **Room Management**: Automatic room creation and cleanup
+- **Hybrid History System**: In-memory caching (50 messages) + database persistence (1000+ messages)
+- **Lazy Loading**: History loaded from database only when needed
+- **Message Persistence**: All messages stored in PostgreSQL database
 
 ## Prerequisites
 
@@ -86,6 +89,11 @@ You can test the server using:
 
 Connect multiple clients to the same room to see real-time message broadcasting.
 
+### Available Commands
+
+- `/user <username>` - Set your username (required before sending messages)
+- `/history` - Load full message history from the database (up to 1000 messages)
+
 ## Design & Architecture
 
 ### Core Framework
@@ -147,12 +155,15 @@ chat_server/
 - Concurrent client handling
 - WebSocket communication
 - Shared-state concurrency model
+- Message persistence with PostgreSQL database
+- Hybrid history system with in-memory caching
 
-### 🔄 Phase 4: Usernames & Structured Messages (PLANNED)
-- [ ] Implement serde for JSON message passing
-- [ ] Allow users to set a username upon connecting
-- [ ] Broadcast UserJoined and UserLeft notifications to the room
-- [ ] Structure all messages as JSON objects (e.g., `{ "type": "NewMessage", "username": "Alice", "content": "Hello!" }`)
+### 🔄 Phase 4: Usernames & Structured Messages (COMPLETED)
+- [✓] Implement serde for JSON message passing
+- [✓] Allow users to set a username upon connecting
+- [✓] Broadcast UserJoined and UserLeft notifications to the room
+- [✓] Structure all messages as JSON objects (e.g., `{ "type": "NewMessage", "username": "Alice", "content": "Hello!" }`)
+- [✓] Message persistence and history loading
 
 ## Future Development (Phase 4 and Beyond)
 
@@ -188,7 +199,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [✓] Room management
 - [✓] User management with usernames
 - [✓] JSON message structuring
-- [ ] Message persistence
+- [✓] Message persistence
 - [ ] Authentication system
 - [ ] REST API endpoints
 - [ ] Client examples
