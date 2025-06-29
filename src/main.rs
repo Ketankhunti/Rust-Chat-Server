@@ -1,93 +1,127 @@
 // src/main.rs
 
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::{
+        ws::{Message, WebSocket},
+        State, WebSocketUpgrade,
+    },
     response::IntoResponse,
     routing::get,
     Router,
 };
-use futures_util::{sink::SinkExt, stream::StreamExt}; // For stream/sink methods
-use std::net::SocketAddr;
-use tokio::net::TcpListener;
+use futures_util::{
+    sink::SinkExt,
+    stream::{SplitSink, SplitStream, StreamExt},
+};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+// We use a type alias for our shared state to make the code cleaner.
+// It's a thread-safe, shared map from a client's unique ID to their WebSocket sender.
+type ChatState = Arc<Mutex<HashMap<Uuid, SplitSink<WebSocket, Message>>>>;
 
 /// The main entry point for our application.
 #[tokio::main]
 async fn main() {
+    // Create the shared state. We wrap our HashMap in a Mutex and an Arc.
+    let state = ChatState::new(Mutex::new(HashMap::new()));
+
     // Define the application routes.
-    // For this phase, we only have one route: a GET request to "/ws"
-    // which will be handled by our `websocket_handler` function.
-    let app = Router::new().route("/ws", get(websocket_handler));
+    // We pass our shared state to the handler using `with_state`.
+    let app = Router::new()
+        .route("/ws", get(websocket_handler))
+        .with_state(state);
 
     // Define the address to listen on.
-    // "0.0.0.0" means it will listen on all available network interfaces.
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("WebSocket server listening on ws://{}...", addr);
 
-    // Create a TCP listener and bind it to the address.
-    let listener = TcpListener::bind(&addr).await.expect("Failed to bind address");
-
-    // Start the server, passing it the defined routes.
-    // This will block indefinitely, handling incoming connections.
+    // Start the server.
+    let listener = tokio::net::TcpListener::bind(&addr).await.expect("Failed to bind address");
     axum::serve(listener, app.into_make_service())
         .await
         .unwrap();
 }
 
 /// The handler for the WebSocket route.
-///
-/// This function is called when a client tries to connect to "/ws".
-/// It uses the `WebSocketUpgrade` extractor to upgrade the HTTP connection
-/// into a persistent WebSocket connection.
-async fn websocket_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
-    // The `on_upgrade` method takes a callback that will be executed
-    // once the WebSocket handshake is successful.
-    // The `handle_socket` function will be our callback.
-    ws.on_upgrade(handle_socket)
+/// It now accepts the shared `ChatState` as an argument.
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<ChatState>, // axum's State extractor
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
 /// Handles an individual WebSocket connection.
 ///
-/// This function is the core of our echo server. It takes ownership of the
-/// WebSocket and enters a loop to process messages.
-async fn handle_socket(mut socket: WebSocket) {
-    println!("New client connected!");
+/// This function now contains the core logic for a client's lifecycle.
+async fn handle_socket(socket: WebSocket, state: ChatState) {
+    // Generate a unique ID for this new client.
+    let client_id = Uuid::new_v4();
+    println!("New client connected: {}", client_id);
 
-    // The `split` method is useful for handling reads and writes concurrently
-    // if we were to use `tokio::spawn`, but for a simple echo server,
-    // we can just use the mutable `socket` directly.
+    // Split the WebSocket into a sender and a receiver.
+    // The sender can be cloned and shared, while the receiver is unique to this task.
+    let (sender, receiver) = socket.split();
 
-    // This loop will run as long as the client is connected and sending messages.
-    // `socket.next().await` waits for the next message from the client.
-    // It returns `Some(Ok(message))` if a message is received,
-    // `Some(Err(e))` if there's an error, and `None` if the connection is closed.
-    while let Some(Ok(msg)) = socket.next().await {
-        match msg {
-            // We only process Text messages. Binary, Ping, Pong, and Close
-            // messages are ignored for this simple example.
-            Message::Text(text) => {
-                println!("Received message: {}", text);
+    // Store the sender part of the socket in our shared state.
+    // We lock the mutex to ensure exclusive access.
+    {
+        let mut clients = state.lock().await;
+        clients.insert(client_id, sender);
+    } // The lock is released here as `clients` goes out of scope.
 
-                // Echo the message back to the client.
-                // We send the message back using `socket.send()`.
-                // `Message::Text` creates a text frame.
-                if socket.send(Message::Text(text)).await.is_err() {
-                    // If `send` returns an error, it means the client has
-                    // disconnected, so we can break the loop.
-                    println!("Client disconnected unexpectedly.");
-                    break;
-                }
-            }
-            Message::Close(_) => {
-                // The client sent a Close frame.
-                println!("Client requested to close connection.");
-                break; // Exit the loop to close the connection.
-            }
-            // Ignore other message types for simplicity
-            _ => {}
+    // This task will handle messages coming *from* the client.
+    let mut receive_task = tokio::spawn(read_from_client(receiver, client_id, state.clone()));
+
+    // Wait for the receive task to complete. This happens when the client disconnects.
+    tokio::select! {
+        _ = &mut receive_task => {
+            // The receive task finished, which means the client disconnected.
         }
     }
 
-    // This part of the code is reached when the loop breaks, which means
-    // the client has disconnected.
-    println!("Client connection closed.");
+    // If we get here, the client has disconnected.
+    // We need to remove them from the shared state.
+    println!("Client {} disconnected.", client_id);
+    let mut clients = state.lock().await;
+    clients.remove(&client_id);
+}
+
+/// Reads messages from a client and broadcasts them to others.
+async fn read_from_client(
+    mut receiver: SplitStream<WebSocket>,
+    client_id: Uuid,
+    state: ChatState,
+) {
+    while let Some(Ok(msg)) = receiver.next().await {
+        if let Message::Text(text) = msg {
+            println!("Received message from {}: {}", client_id, text);
+            // Broadcast the message to all other connected clients.
+            broadcast_message(text.to_string(), client_id, &state).await;
+        }
+    }
+}
+
+/// Broadcasts a message to all connected clients except the sender.
+async fn broadcast_message(text: String, sender_id: Uuid, state: &ChatState) {
+    let mut clients = state.lock().await;
+
+    // We create a message to be sent. We can add more info here later.
+    let broadcast_text = format!("[{}]: {}", sender_id, text);
+    let message = Message::Text(broadcast_text.into());
+
+    // Iterate over all connected clients.
+    for (id, sender) in clients.iter_mut() {
+        // Don't send the message back to the original sender.
+        if *id != sender_id {
+            // Send the message. If it fails, the client might have disconnected
+            // abruptly. We can log this but won't handle removal here, as the
+            // main `handle_socket` task will take care of cleanup.
+            if sender.send(message.clone()).await.is_err() {
+                println!("Failed to send message to client {}", id);
+            }
+        }
+    }
 }
