@@ -186,8 +186,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [✓] Chat room functionality
 - [✓] Message broadcasting
 - [✓] Room management
-- [ ] User management with usernames
-- [ ] JSON message structuring
+- [✓] User management with usernames
+- [✓] JSON message structuring
 - [ ] Message persistence
 - [ ] Authentication system
 - [ ] REST API endpoints
